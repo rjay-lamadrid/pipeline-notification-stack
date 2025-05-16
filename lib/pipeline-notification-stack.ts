@@ -5,6 +5,7 @@ import { NodejsFunction } from "aws-cdk-lib/aws-lambda-nodejs";
 import { Runtime } from "aws-cdk-lib/aws-lambda";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as sns from 'aws-cdk-lib/aws-sns';
+import * as subs from 'aws-cdk-lib/aws-sns-subscriptions';
 
 import * as path from 'path';
 import * as dotenv from "dotenv";
@@ -15,8 +16,6 @@ dotenv.config();
 export class PipelineNotificationStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: StackProps) {
     super(scope, id, props);
-
-    const topic = sns.Topic.fromTopicArn(this, 'ImportedTopic', process.env.TOPIC_ARN as string);
 
     const lambdaRole = new iam.Role(
       this,
@@ -65,6 +64,25 @@ export class PipelineNotificationStack extends cdk.Stack {
         role: lambdaRole,
       }
     );
+
+    // create SNS topic
+    const topic = new sns.Topic(this, 'SnsPipelineNotification', {
+      topicName: 'sns-pipeline-notification',
+    });
+    
+    // Add the policy manually
+    topic.addToResourcePolicy(new iam.PolicyStatement({
+      sid: 'CodeNotification_publish',
+      effect: iam.Effect.ALLOW,
+      principals: [
+        new iam.ServicePrincipal('codestar-notifications.amazonaws.com'),
+      ],
+      actions: ['SNS:Publish'],
+      resources: [topic.topicArn],
+    }));
+
+    // Subscribe the Lambda to the topic
+    topic.addSubscription(new subs.LambdaSubscription(notifyLambda));
 
     // Grant SNS permission to invoke the Lambda
     notifyLambda.addPermission('AllowSNSInvoke', {
