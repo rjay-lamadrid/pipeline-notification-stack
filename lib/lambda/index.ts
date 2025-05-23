@@ -1,18 +1,18 @@
-import { SESClient, SendEmailCommand } from "@aws-sdk/client-ses";
+import { SendEmailCommand, SESClient } from "@aws-sdk/client-ses";
 
+const region = process.env.AWS_REGION || "ap-northeast-1";
 const ses = new SESClient({
-  region: process.env.AWS_REGION || "ap-northeast-1",
+  region: region,
 });
 
 export const handler = async (event: any) => {
   console.log("Event", JSON.stringify(event, null, 2));
   const snsEvent = event.Records[0].Sns;
 
-  const message = JSON.parse(snsEvent.Message);
-
   let subject = "";
   let data = null;
 
+  const message = JSON.parse(snsEvent.Message);
   if (message.approval) {
     const detail = message.approval;
     data = {
@@ -23,41 +23,72 @@ export const handler = async (event: any) => {
       region: message.region,
       time: snsEvent.Timestamp,
       type: "approval",
-    }
+    };
 
     subject = snsEvent.Subject;
+    return sendEmail(data, subject);
   }
 
-  if (message.detail) {
-    const detail = message.detail;
-
-    data = {
-      pipeline: detail.pipeline,
-      state: detail.state,
-      time: snsEvent.Timestamp,
-      region: message.region,
-      type: "state",
-    }
-
-    if (data.state === "FAILED") {
+  const detail = message.detail;
+  switch (message.source) {
+    case "aws.codepipeline":
       data = {
-        ...data,
-        additionalInformation: message.additionalAttributes.failedActions[0].additionalInformation,
-        failedStage: message.additionalAttributes.failedStage,
-      }
-    }
+        pipeline: detail.pipeline,
+        state: detail.state,
+        time: snsEvent.Timestamp,
+        region: message.region,
+        type: "state",
+      };
 
-    subject = `[ALERT] CodePipeline ${data.pipeline} ${data.state}`;
+      if (data.state === "FAILED") {
+        data = {
+          ...data,
+          additionalInformation:
+            message.additionalAttributes.failedActions[0].additionalInformation,
+          failedStage: message.additionalAttributes.failedStage,
+        };
+      }
+
+      subject = `[ALERT] CodePipeline ${data.pipeline} ${data.state}`;
+      break;
+    case "aws.cloudformation":
+      data = {
+        stackId: detail["stack-id"],
+        status: detail["status-details"].status,
+        timestamp: message.time,
+        region: message.region,
+        type: "cloudformation",
+      };
+      subject = `[ALERT] CloudFormation ${message["detail-type"]} - ${data.status}`;
+      break;
+    default:
+      break;
   }
 
-  if (!data) throw new Error("No data found");
+  return sendEmail(data, subject);
+};
+
+async function sendEmail(data: any, subject: string): Promise<void> {
+  if (!data) return;
 
   const recipient = process.env.EMAIL_RECIPIENT!;
   const sender = process.env.EMAIL_SENDER!;
 
-  const emailContent = data.type === "approval"
-    ? pipelineApprovalContent(data)
-    : pipelineStateContent(data);
+  let emailContent = "";
+  switch (data.type) {
+    case "approval":
+      emailContent = pipelineApprovalContent(data);
+      break;
+    case "state":
+      emailContent = pipelineStateContent(data);
+      break;
+    case "cloudformation":
+      return;
+      emailContent = cloudFormationState(data);
+      break;
+    default:
+      return;
+  }
 
   const params = {
     Destination: { ToAddresses: [recipient] },
@@ -75,9 +106,10 @@ export const handler = async (event: any) => {
     },
     Source: sender,
   };
-console.log(JSON.stringify(params));
+
+  //console.log("Sending email", JSON.stringify(params, null, 2));
   await ses.send(new SendEmailCommand(params));
-};
+}
 
 function pipelineStateContent(data: any): string {
   return `
@@ -88,10 +120,18 @@ function pipelineStateContent(data: any): string {
     Pipeline: ${data.pipeline}
     State: ${data.state}
     Time: ${data.time}
-    ${data.additionalInformation ? `Additional Information: ${data.additionalInformation}` : ""}
+    ${
+      data.additionalInformation
+        ? `Additional Information: ${data.additionalInformation}`
+        : ""
+    }
     ${data.failedStage ? `Failed Stage: ${data.failedStage}` : ""}
 
-    View: https://${data.region}.console.aws.amazon.com/codesuite/codepipeline/pipelines/${data.pipeline}/view?region=${data.region}`;
+    View: https://${
+      data.region
+    }.console.aws.amazon.com/codesuite/codepipeline/pipelines/${
+    data.pipeline
+  }/view?region=${data.region}`;
 }
 
 function pipelineApprovalContent(data: any): string {
@@ -112,4 +152,20 @@ function pipelineApprovalContent(data: any): string {
     Deadline: This review request will expire on ${data.expires}
 
     View: https://${data.region}.console.aws.amazon.com/codesuite/codepipeline/pipelines/${data.pipeline}/view?region=${data.region}`;
+}
+
+function cloudFormationState(data: any): string {
+  return `
+    Hello,
+
+    The following CloudFormation stack state changed:
+    
+    ResourceType: AWS::CloudFormation::Stack
+    StackId: ${data.stackId}
+    ResourceStatus: ${data.status}
+    Timestamp: ${data.timestamp}
+
+    --Additional Information--
+    Cloudformation Stack: https://${region}.console.aws.amazon.com/cloudformation/home?region=${region}#/stacks/stackinfo?stackId=${data.stackId}
+  `;
 }

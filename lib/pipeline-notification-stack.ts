@@ -59,51 +59,71 @@ export class PipelineNotificationStack extends cdk.Stack {
       role: lambdaRole,
     });
 
-    // create SNS topic
-    const topic = new sns.Topic(this, "SnsPipelineNotification", {
-      topicName: "sns-pipeline-notification",
-    });
-
-    // Add the policy manually
-    topic.addToResourcePolicy(
-      new iam.PolicyStatement({
-        sid: "CodeNotification_publish",
-        effect: iam.Effect.ALLOW,
-        principals: [
-          new iam.ServicePrincipal("codestar-notifications.amazonaws.com"),
-        ],
-        actions: ["SNS:Publish"],
-        resources: [topic.topicArn],
-      })
+    const pipelineEventRule = new events.Rule(
+      this,
+      "PipelineEventNotification",
+      {
+        ruleName: "PipelineEventNotification",
+        description: "Pipeline event notification",
+        eventPattern: {
+          source: ["aws.codepipeline"],
+          detail: {
+            pipeline: ["MotenasuTrackingPipeline"],
+          }
+        },
+      }
     );
+    // Get the underlying CfnRule
+    const cfnRule = pipelineEventRule.node.defaultChild as events.CfnRule;
 
-    // Subscribe the Lambda to the topic
-    topic.addSubscription(new subs.LambdaSubscription(notifyLambda));
-
-    // Grant SNS permission to invoke the Lambda
-    notifyLambda.addPermission("AllowSNSInvoke", {
-      principal: new iam.ServicePrincipal("sns.amazonaws.com"),
-      action: "lambda:InvokeFunction",
-      sourceArn: topic.topicArn,
+    // Override the EventPattern to include the OR logic
+    cfnRule.addPropertyOverride("EventPattern", {
+      // OR logic for different event conditions
+      $or: [
+        // Pipeline execution state changes
+        {
+          "detail-type": ["CodePipeline Pipeline Execution State Change"],
+          detail: {
+            state: ["STARTED","SUCCEEDED", "FAILED", "CANCELED", "STOPPED"],
+          },
+        },
+        // Action execution state change for approvals
+        {
+          "detail-type": ["CodePipeline Action Execution State Change"],
+          detail: {
+            stage: ["Approval"],
+            state: ["STARTED"],
+            action: ["Manual_Approval"]
+          },
+        },
+      ],
     });
+
+    pipelineEventRule.addTarget(new targets.LambdaFunction(notifyLambda, {
+      retryAttempts: 2,
+      maxEventAge: Duration.minutes(1),
+    }));
 
     const cloudFormationRule = new events.Rule(
       this,
       "CloudFormationStackStateNotification",
       {
+        ruleName: "CloudFormationStackStateNotification",
         eventPattern: {
           source: ["aws.cloudformation"],
           detailType: ["CloudFormation Stack Status Change"],
           detail: {
+            "stack-id": [
+              {
+                "wildcard": "*motenasu-tracking-stack-*",
+              },
+            ],
             "status-details": {
               status: [
-                "CREATE_IN_PROGRESS",
                 "CREATE_COMPLETE",
                 "CREATE_FAILED",
-                "DELETE_IN_PROGRESS",
                 "DELETE_COMPLETE",
                 "DELETE_FAILED",
-                "UPDATE_IN_PROGRESS",
                 "UPDATE_COMPLETE",
                 "UPDATE_FAILED",
               ],
@@ -112,6 +132,9 @@ export class PipelineNotificationStack extends cdk.Stack {
         },
       }
     );
-    cloudFormationRule.addTarget(new targets.SnsTopic(topic));
+    cloudFormationRule.addTarget(new targets.LambdaFunction(notifyLambda, {
+      retryAttempts: 2,
+      maxEventAge: Duration.minutes(1),
+    }));
   }
 }
